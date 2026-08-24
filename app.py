@@ -1,8 +1,10 @@
 from datetime import datetime
+import hashlib
 import io
 import json
 import os
 import re
+import secrets
 import sqlite3
 import time
 from bs4 import BeautifulSoup
@@ -18,7 +20,9 @@ import streamlit as st
 from textblob import TextBlob
 from xhtml2pdf import pisa
 
+# ---------------------------------------------------------
 # 1. Page Configuration & Theme
+# ---------------------------------------------------------
 st.set_page_config(
     page_title="StratIntel Enterprise • Market Intelligence OS",
     page_icon="https://api.iconify.design/lucide:activity.svg?color=%2338bdf8",
@@ -106,8 +110,8 @@ st.markdown(
         border: 1px solid rgba(56, 189, 248, 0.3);
         border-radius: 16px;
         padding: 2.5rem;
-        max-width: 650px;
-        margin: 3rem auto;
+        max-width: 550px;
+        margin: 2rem auto;
         box-shadow: 0 12px 40px -10px rgba(0, 0, 0, 0.7);
         text-align: center;
     }
@@ -136,12 +140,22 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# 2. Database Engine with Profile & Report Persistence
+# ---------------------------------------------------------
+# 2. Database Engine & Authentication Services
+# ---------------------------------------------------------
 DB_FILE = "reports_history.db"
+
+def hash_password(password: str, salt: str = None) -> tuple[str, str]:
+    if not salt:
+        salt = secrets.token_hex(16)
+    hashed = hashlib.sha256((password + salt).encode()).hexdigest()
+    return hashed, salt
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    
+    # Reports Table
     c.execute("""
         CREATE TABLE IF NOT EXISTS reports (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,33 +169,63 @@ def init_db():
             user_name TEXT
         )
     """)
+    
+    # Persistent Users Table
     c.execute("""
-        CREATE TABLE IF NOT EXISTS profile (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            user_name TEXT
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            created_at TEXT
         )
     """)
+    
     c.execute("PRAGMA table_info(reports)")
     columns = [col[1] for col in c.fetchall()]
     if "user_name" not in columns:
         c.execute("ALTER TABLE reports ADD COLUMN user_name TEXT")
+        
     conn.commit()
     conn.close()
 
-def save_profile_name(name: str):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO profile (id, user_name) VALUES (1, ?)", (name,))
-    conn.commit()
-    conn.close()
+def register_user(username: str, password: str) -> tuple[bool, str]:
+    clean_username = username.strip()
+    if not clean_username or not password:
+        return False, "Username and password cannot be empty."
+    if len(password) < 4:
+        return False, "Password must be at least 4 characters long."
 
-def get_profile_name() -> str:
+    pwd_hash, salt = hash_password(password)
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT user_name FROM profile WHERE id = 1")
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute("""
+            INSERT INTO users (username, password_hash, salt, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (clean_username, pwd_hash, salt, now))
+        conn.commit()
+        conn.close()
+        return True, "Account registered successfully! Please sign in."
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False, "Username already exists. Please choose a different username or sign in."
+
+def authenticate_user(username: str, password: str) -> bool:
+    clean_username = username.strip()
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT password_hash, salt FROM users WHERE username = ?", (clean_username,))
     row = c.fetchone()
     conn.close()
-    return row[0] if row else ""
+    
+    if not row:
+        return False
+        
+    stored_hash, salt = row
+    test_hash, _ = hash_password(password, salt)
+    return test_hash == stored_hash
 
 def save_report_to_db(topic: str, mode: str, region: str, content: str, sources_json: str, metrics_json: str, user_name: str):
     conn = sqlite3.connect(DB_FILE)
@@ -194,10 +238,15 @@ def save_report_to_db(topic: str, mode: str, region: str, content: str, sources_
     conn.commit()
     conn.close()
 
-def get_all_reports_from_db():
+def get_all_reports_from_db(user_name: str):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT id, timestamp, topic, mode, region, content, sources_json, metrics_json, user_name FROM reports ORDER BY id DESC")
+    c.execute("""
+        SELECT id, timestamp, topic, mode, region, content, sources_json, metrics_json, user_name 
+        FROM reports 
+        WHERE user_name = ? 
+        ORDER BY id DESC
+    """, (user_name,))
     rows = c.fetchall()
     conn.close()
     return [
@@ -210,30 +259,100 @@ def get_all_reports_from_db():
             "content": r[5],
             "sources_json": r[6] if r[6] else "[]",
             "metrics_json": r[7] if r[7] else "{}",
-            "user_name": r[8] if len(r) > 8 and r[8] else "Lead Analyst"
+            "user_name": r[8] if len(r) > 8 and r[8] else user_name
         }
         for r in rows
     ]
 
-def clear_all_reports_from_db():
+def clear_all_reports_from_db(user_name: str):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("DELETE FROM reports")
+    c.execute("DELETE FROM reports WHERE user_name = ?", (user_name,))
     conn.commit()
     conn.close()
 
 init_db()
 
-# 3. Authentication
+# ---------------------------------------------------------
+# 3. Authentication UI Gate
+# ---------------------------------------------------------
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "user_name" not in st.session_state:
+    st.session_state.user_name = ""
+
+if not st.session_state.authenticated:
+    st.markdown(
+        """
+        <div class="onboarding-card">
+            <h2 style="color: #38bdf8; font-weight: 800; margin-bottom: 0.5rem;">Access StratIntel Enterprise OS</h2>
+            <p style="color: #94a3b8; font-size: 0.95rem; margin-bottom: 0.5rem;">
+                Secure Strategic Intelligence & Competitive Dossier Platform
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    col_a, col_b, col_c = st.columns([1, 1.8, 1])
+    with col_b:
+        tab_login, tab_register = st.tabs(["🔐 Sign In", "📝 Register New Account"])
+        
+        with tab_login:
+            with st.form("login_form"):
+                login_user = st.text_input("Username:", placeholder="Enter your username")
+                login_pwd = st.text_input("Password:", type="password", placeholder="Enter your password")
+                login_btn = st.form_submit_button("🚀 Sign In to StratIntel", use_container_width=True)
+                
+                if login_btn:
+                    if authenticate_user(login_user, login_pwd):
+                        st.session_state.authenticated = True
+                        st.session_state.user_name = login_user.strip()
+                        st.success(f"Authenticated as {login_user.strip()}. Loading workspace...")
+                        time.sleep(0.3)
+                        st.rerun()
+                    else:
+                        st.error("Invalid username or password. Please check your credentials.")
+                        
+        with tab_register:
+            with st.form("register_form"):
+                reg_user = st.text_input("Choose Username:", placeholder="e.g. Jacob_Smiths")
+                reg_pwd = st.text_input("Choose Password:", type="password", placeholder="Create a secure passcode")
+                reg_pwd_confirm = st.text_input("Confirm Password:", type="password", placeholder="Repeat your passcode")
+                reg_btn = st.form_submit_button("✨ Create Account", use_container_width=True)
+                
+                if reg_btn:
+                    if reg_pwd != reg_pwd_confirm:
+                        st.error("Passwords do not match.")
+                    else:
+                        success, message = register_user(reg_user, reg_pwd)
+                        if success:
+                            st.success(message)
+                        else:
+                            st.error(message)
+                            
+    st.stop()
+
+# ---------------------------------------------------------
+# 4. Initialize Gemini Core
+# ---------------------------------------------------------
 load_dotenv()
 api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
-    st.error("⚠️ GEMINI_API_KEY not detected in .env file.")
+    try:
+        api_key = st.secrets.get("GEMINI_API_KEY")
+    except Exception:
+        api_key = None
+
+if not api_key:
+    st.error("⚠️ GEMINI_API_KEY not detected in .env file or Secrets.")
     st.stop()
 
 client = genai.Client(api_key=api_key)
 
-# 4. Smart Model Fallback Router
+# ---------------------------------------------------------
+# 5. Smart Model Fallback Router
+# ---------------------------------------------------------
 MODEL_PRIORITY_CASCADE = [
     "gemini-3.6-flash",
     "gemini-3.5-flash-lite",
@@ -295,34 +414,9 @@ Respond in strictly valid JSON format with this schema:
     except Exception:
         return user_raw_query, "", False
 
-# 5. User Identity Management
-if "user_name" not in st.session_state:
-    st.session_state.user_name = get_profile_name()
-
-if not st.session_state.user_name:
-    st.markdown(
-        """
-        <div class="onboarding-card">
-            <h2 style="color: #38bdf8; font-weight: 800; margin-bottom: 0.5rem;">Access StratIntel Enterprise OS</h2>
-            <p style="color: #94a3b8; font-size: 0.95rem; margin-bottom: 1.5rem;">
-                Please authenticate your analyst credentials to establish a strategic intelligence workspace.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    col_a, col_b, col_c = st.columns([1, 2, 1])
-    with col_b:
-        with st.form("user_onboarding_form"):
-            input_name = st.text_input("Full Name or Designation:", placeholder="e.g., Alex Vance (Principal Strategist)")
-            submit_btn = st.form_submit_button("🚀 Initialize Secure Session", use_container_width=True)
-            if submit_btn and input_name.strip():
-                st.session_state.user_name = input_name.strip()
-                save_profile_name(input_name.strip())
-                st.rerun()
-    st.stop()
-
+# ---------------------------------------------------------
 # 6. Executive PDF Engine
+# ---------------------------------------------------------
 def generate_pdf(title: str, content: str, mode: str, region: str, analyst: str) -> bytes:
     cleaned_text = (
         re.sub(r"[^\x00-\x7F]+", " ", content)
@@ -468,14 +562,18 @@ def generate_pdf(title: str, content: str, mode: str, region: str, analyst: str)
     pisa.CreatePDF(full_html, dest=pdf_stream)
     return pdf_stream.getvalue()
 
-# 7. Sidebar Controls & History
-saved_reports = get_all_reports_from_db()
+# ---------------------------------------------------------
+# 7. Sidebar Controls & Isolated Intelligence Vault
+# ---------------------------------------------------------
+saved_reports = get_all_reports_from_db(st.session_state.user_name)
 
 with st.sidebar:
     st.markdown(f"### 👤 **Active Analyst**\n**`{st.session_state.user_name}`**")
-    if st.button("🔄 Switch User", use_container_width=True):
+    if st.button("🚪 Sign Out", use_container_width=True):
+        st.session_state.authenticated = False
         st.session_state.user_name = ""
-        save_profile_name("")
+        st.session_state.active_report = None
+        st.session_state.follow_ups = []
         st.rerun()
 
     st.markdown("---")
@@ -523,14 +621,16 @@ with st.sidebar:
                 st.markdown("<div style='margin-bottom: 0.5rem;'></div>", unsafe_allow_html=True)
 
         if st.button("🗑️ Clear Intelligence Vault", use_container_width=True):
-            clear_all_reports_from_db()
+            clear_all_reports_from_db(st.session_state.user_name)
             st.session_state.active_report = None
             st.session_state.follow_ups = []
             st.rerun()
     else:
-        st.info("No saved dossiers found.")
+        st.info("No saved dossiers found for this account.")
 
+# ---------------------------------------------------------
 # 8. Hero Banner
+# ---------------------------------------------------------
 st.markdown(
     f"""
     <div class="brand-hero">
@@ -548,7 +648,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ---------------------------------------------------------
 # 9. Robust Search & Resilient Crawl Engine
+# ---------------------------------------------------------
 def fetch_market_data_with_telemetry(query: str, max_results: int, scrape_html: bool, progress_bar, status_text) -> tuple[str, list, float]:
     results_data = []
     
@@ -638,7 +740,9 @@ def fetch_market_data_with_telemetry(query: str, max_results: int, scrape_html: 
 USER_AVATAR = "https://api.iconify.design/solar:user-circle-bold-duotone.svg?color=%2338bdf8"
 AI_AVATAR = "https://api.iconify.design/solar:chart-square-bold-duotone.svg?color=%23818cf8"
 
-# 10. Render Workspace
+# ---------------------------------------------------------
+# 10. Workspace & Reports Viewer
+# ---------------------------------------------------------
 quick_input = None
 
 if "active_report" in st.session_state and st.session_state.active_report:
@@ -892,7 +996,9 @@ elif not saved_reports:
     if chip_col3.button("🚗 Solid-State EV Battery Manufacturers", use_container_width=True):
         quick_input = "Solid-state electric vehicle battery manufacturers and pricing"
 
-# 11. Sticky Chat Bar
+# ---------------------------------------------------------
+# 11. Sticky Chat Bar & Execution Trigger
+# ---------------------------------------------------------
 user_query = st.chat_input("Enter a company, product niche, or business model to research (Press Enter)...")
 active_target = user_query or quick_input
 
@@ -970,7 +1076,7 @@ Construct a detailed Markdown comparison table (at least 3-4 real competitors):
 
 ## 4. Unexploited Market White-Space & Strategic Entry Blueprint
 - **Identified Market Gaps:** Unaddressed customer pain points and inefficiencies in incumbent offerings.
-- **Go-To-Market (GTM) Strategy:** Tactical recommendations for product positioning, pricing arbitrage, and customer acquisition.
+- **Go-To-Market (GTM) Strategy for {st.session_state.user_name} & Strategic Planners:** Tactical recommendations for product positioning, pricing arbitrage, and customer acquisition.
 """
 
         try:
