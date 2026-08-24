@@ -1,0 +1,12 @@
+streamlit
+google-genai
+python-dotenv
+duckduckgo-search
+beautifulsoup4
+requests
+fpdf2
+markdown
+xhtml2pdf
+pandas
+plotly
+textblob
